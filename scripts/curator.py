@@ -28,6 +28,7 @@ import ctypes
 import hashlib
 import ctypes.util
 import dataclasses
+import glob
 import json
 import os
 import plistlib
@@ -2198,6 +2199,150 @@ def prune_playwright_browser_versions(
     }
 
 
+def clean_chrome_code_sign_clones(
+    dry_run: bool = True,
+    min_age_hours: float = 2.0,
+    test_roots: Optional[List[str]] = None,
+    test_active_clones: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Cleans orphaned macOS Chrome code_sign_clone sandboxes in /private/var/folders/*/*/X/com.google.Chrome.code_sign_clone.
+    Retains active clones currently open by running Chrome / ThemeWidget processes via `lsof +D`.
+    Prunes inactive historical clone folders older than `min_age_hours` (preventing zombie clone accumulation).
+    """
+    freed_bytes = 0
+    removed_items: List[str] = []
+    reclaimed_inodes = 0
+
+    roots = test_roots if test_roots is not None else glob.glob("/private/var/folders/*/*/X/com.google.Chrome.code_sign_clone")
+    now = time.time()
+    min_age_sec = min_age_hours * 3600.0
+
+    for root in roots:
+        if not os.path.isdir(root) or not is_local_filesystem(root):
+            continue
+
+        active_clones: Set[str] = set()
+        if test_active_clones is not None:
+            active_clones = set(test_active_clones)
+        else:
+            try:
+                res = subprocess.run(
+                    ["/usr/sbin/lsof", "+D", root],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5.0,
+                )
+                for line in res.stdout.splitlines():
+                    if "com.google.Chrome.code_sign_clone/" in line:
+                        parts = line.split()
+                        for p in parts:
+                            idx = p.find("com.google.Chrome.code_sign_clone/")
+                            if idx != -1:
+                                sub = p[idx + len("com.google.Chrome.code_sign_clone/"):].split("/")[0]
+                                active_clones.add(sub)
+            except Exception:
+                continue
+
+        try:
+            for entry in os.scandir(root):
+                if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
+                    continue
+                if entry.name in active_clones:
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    if (now - st.st_mtime) < min_age_sec:
+                        continue
+                except OSError:
+                    continue
+
+                sz, fcnt, _ = measure_directory_fast(entry.path, budget_seconds=1.5)
+                freed_bytes += sz
+                reclaimed_inodes += fcnt
+                removed_items.append(entry.path)
+                if not dry_run:
+                    shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            pass
+
+    return {
+        "dry_run": dry_run,
+        "freed_bytes": freed_bytes,
+        "freed_human": format_bytes(freed_bytes),
+        "reclaimed_inodes": reclaimed_inodes,
+        "removed_items": removed_items,
+    }
+
+
+def clean_stale_tmp_build_residue(
+    tmp_dir: str = "/private/tmp",
+    min_age_hours: float = 24.0,
+    prefixes: Tuple[str, ...] = ("wbasar", "apkcheck", "node_modules", "vmp-", "det-"),
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Cleans abandoned multi-agent build/unpack directories and scratch assets in /private/tmp older than `min_age_hours`.
+    """
+    freed_bytes = 0
+    removed_items: List[str] = []
+    base = os.path.realpath(tmp_dir)
+    now = time.time()
+    min_age_sec = min_age_hours * 3600.0
+
+    if os.path.isdir(base) and is_local_filesystem(base):
+        try:
+            for entry in os.scandir(base):
+                if not any(entry.name.startswith(pfx) for pfx in prefixes):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    if (now - st.st_mtime) < min_age_sec:
+                        continue
+                except OSError:
+                    continue
+
+                # Ensure no active processes have open handles
+                try:
+                    res = subprocess.run(
+                        ["/usr/sbin/lsof", entry.path],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=3.0,
+                    )
+                    if res.stdout.strip():
+                        continue
+                except Exception:
+                    continue
+
+                if entry.is_dir(follow_symlinks=False):
+                    sz, _, _ = measure_directory_fast(entry.path, budget_seconds=1.5)
+                    freed_bytes += sz
+                    removed_items.append(entry.path)
+                    if not dry_run:
+                        shutil.rmtree(entry.path, ignore_errors=True)
+                elif entry.is_file(follow_symlinks=False):
+                    try:
+                        sz = entry.stat(follow_symlinks=False).st_size
+                        freed_bytes += sz
+                        removed_items.append(entry.path)
+                        if not dry_run:
+                            os.unlink(entry.path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    return {
+        "dry_run": dry_run,
+        "freed_bytes": freed_bytes,
+        "freed_human": format_bytes(freed_bytes),
+        "removed_items": removed_items,
+    }
+
+
 def run_periodic_routine(
     apply: bool = False,
     min_reclaim_mb: float = 10.0,
@@ -2254,6 +2399,12 @@ def run_periodic_routine(
     pw_rot_res = prune_playwright_browser_versions(dry_run=dry_run)
     total_cleaned_bytes += pw_rot_res["freed_bytes"]
 
+    chrome_clones_res = clean_chrome_code_sign_clones(dry_run=dry_run)
+    total_cleaned_bytes += chrome_clones_res["freed_bytes"]
+
+    tmp_residue_res = clean_stale_tmp_build_residue(dry_run=dry_run)
+    total_cleaned_bytes += tmp_residue_res["freed_bytes"]
+
     # Phase 4: Lossless SQLite Compaction
     sqlite_dbs = analyze_sqlite_databases()
     threshold_bytes = int(min_reclaim_mb * 1024 * 1024)
@@ -2285,6 +2436,8 @@ def run_periodic_routine(
             "bundle_migration": bm_res,
             "cursor_version_rotation": cursor_rot_res,
             "playwright_version_rotation": pw_rot_res,
+            "chrome_code_sign_clones": chrome_clones_res,
+            "tmp_build_residue": tmp_residue_res,
             "actions": cleaned_actions,
         },
         "sqlite_vacuum": {

@@ -657,6 +657,77 @@ class TestMacTieredCurator(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(pw_root, "chromium_headless_shell-1200")))
             self.assertTrue(os.path.exists(os.path.join(pw_root, "chromium_headless_shell-1201")))
 
+    def test_clean_chrome_code_sign_clones(self) -> None:
+        with tempfile.TemporaryDirectory(dir=str(Path.home())) as tmp_root:
+            clone_root = os.path.join(tmp_root, "com.google.Chrome.code_sign_clone")
+            active_clone = os.path.join(clone_root, "code_sign_clone.ACTIVE")
+            orphan_clone = os.path.join(clone_root, "code_sign_clone.ORPHAN")
+            os.makedirs(active_clone, exist_ok=True)
+            os.makedirs(orphan_clone, exist_ok=True)
+
+            with open(os.path.join(active_clone, "test.bin"), "wb") as f:
+                f.write(b"a" * 1024)
+            with open(os.path.join(orphan_clone, "test.bin"), "wb") as f:
+                f.write(b"b" * 2048)
+
+            # 模拟 orphan 是 3 小时前创建的
+            past = time.time() - 3.0 * 3600
+            os.utime(orphan_clone, (past, past))
+
+            # dry_run = True
+            dry = curator.clean_chrome_code_sign_clones(
+                dry_run=True,
+                min_age_hours=2.0,
+                test_roots=[clone_root],
+                test_active_clones={"code_sign_clone.ACTIVE"},
+            )
+            self.assertEqual(len(dry["removed_items"]), 1)
+            self.assertTrue(os.path.exists(orphan_clone))
+            self.assertTrue(os.path.exists(active_clone))
+
+            # dry_run = False
+            apply = curator.clean_chrome_code_sign_clones(
+                dry_run=False,
+                min_age_hours=2.0,
+                test_roots=[clone_root],
+                test_active_clones={"code_sign_clone.ACTIVE"},
+            )
+            self.assertEqual(len(apply["removed_items"]), 1)
+            self.assertFalse(os.path.exists(orphan_clone))
+            self.assertTrue(os.path.exists(active_clone))
+
+    def test_clean_stale_tmp_build_residue(self) -> None:
+        with tempfile.TemporaryDirectory(dir=str(Path.home())) as tmp_root:
+            old_build = os.path.join(tmp_root, "wbasar_test_dir")
+            new_build = os.path.join(tmp_root, "wbasar_fresh_dir")
+            other_dir = os.path.join(tmp_root, "unrelated_dir")
+            os.makedirs(old_build, exist_ok=True)
+            os.makedirs(new_build, exist_ok=True)
+            os.makedirs(other_dir, exist_ok=True)
+
+            past = time.time() - 30.0 * 3600  # 30 hours old
+            os.utime(old_build, (past, past))
+
+            dry = curator.clean_stale_tmp_build_residue(
+                tmp_dir=tmp_root,
+                min_age_hours=24.0,
+                prefixes=("wbasar",),
+                dry_run=True,
+            )
+            self.assertEqual(len(dry["removed_items"]), 1)
+            self.assertTrue(os.path.exists(old_build))
+
+            apply = curator.clean_stale_tmp_build_residue(
+                tmp_dir=tmp_root,
+                min_age_hours=24.0,
+                prefixes=("wbasar",),
+                dry_run=False,
+            )
+            self.assertEqual(len(apply["removed_items"]), 1)
+            self.assertFalse(os.path.exists(old_build))
+            self.assertTrue(os.path.exists(new_build))
+            self.assertTrue(os.path.exists(other_dir))
+
 
 if __name__ == "__main__":
     unittest.main()
